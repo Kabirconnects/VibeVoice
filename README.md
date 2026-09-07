@@ -154,6 +154,19 @@ VIBEVOICE_MODE=local
 MODEL_PATH=vibevoice/VibeVoice-1.5B     # ~3GB, auto-downloaded from HuggingFace
 ```
 
+**You can use any VibeVoice model** by changing `MODEL_PATH` (or passing `--model_path` on the CLI) — all auto-download from HuggingFace:
+
+| Model | Size | Best for |
+|---|---|---|
+| `vibevoice/VibeVoice-1.5B` (default) | ~3GB | Long-form multi-speaker, most GPUs |
+| `vibevoice/VibeVoice-7B` | ~14GB | Higher quality/Chinese, needs a big GPU |
+| `vibevoice/VibeVoice-1.5B-hf` | ~3GB | Transformers-compatible (batched inference, torch compile) |
+| `vibevoice/VibeVoice-7B-hf` | ~14GB | Transformers-compatible |
+
+> The **Streaming-0.5B** model (real-time, 1 speaker) uses its own script — see the [Usage](#usage) section below.
+
+Local mode also supports **voice cloning** from `.wav` files in `demo/voices/` — each speaker can have their own cloned voice. See [Usage](#usage) for examples.
+
 ## Running
 
 Once `.env` is configured, **run the same command in both modes** — it reads your config automatically:
@@ -185,7 +198,7 @@ Output is saved to `./outputs/`.
 |---|---|---|
 | Factory default | `local` | `vibevoice/VibeVoice-1.5B` (~3GB download, needs GPU) |
 
-A warning banner prints first telling you how to switch to API mode. Nobody is surprised by the download.
+A warning banner prints first telling you how to switch to API mode. Nobody is surprised by the download. You can still use any other VibeVoice model by passing `--model_path` (see the [local mode table](#2-local-mode--gpu-required-model-auto-downloads)).
 
 ## Usage
 
@@ -198,6 +211,8 @@ We observed users may encounter occasional instability when synthesizing Chinese
 - If you found the generated voice speak too fast. Please try to chunk your text with multiple speaker turns with same speaker label.
 
 We'd like to thank [PsiPi](https://huggingface.co/PsiPi) for sharing an interesting way for emotion control. Details can be found via [discussion #12](https://huggingface.co/microsoft/VibeVoice-1.5B/discussions/12).
+
+> **Tip — model choice:** all examples below pass `--model_path`. Omit it to use the default `vibevoice/VibeVoice-1.5B`, or set `MODEL_PATH` in `.env` to change the default. Pick any model from the [table above](#2-local-mode--gpu-required-model-auto-downloads).
 
 **Option 1: Launch Gradio demo**
 
