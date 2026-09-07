@@ -33,7 +33,11 @@ dependencies = [
     "absl-py",
     "gradio==5.50.0",
     "av",
-    "aiortc"
+    "aiortc",
+    # API-mode dependencies (so `pip install -e .` alone covers both modes)
+    "python-dotenv",
+    "httpx",
+    "soundfile",
 ]
 
 [project.optional-dependencies]

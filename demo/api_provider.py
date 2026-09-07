@@ -52,8 +52,43 @@ def _parse_voices(raw: str) -> List[str]:
     return [v.strip() for v in raw.split(",") if v.strip()]
 
 
+_warned_missing_env = False
+
+
+def _warn_if_no_env() -> None:
+    """Print a one-time notice when running without a configured .env file."""
+    global _warned_missing_env
+    if _warned_missing_env:
+        return
+    _warned_missing_env = True
+
+    # Only warn if no explicit VIBEVOICE_MODE was set (i.e. we're about to
+    # fall back to local mode) and there's no .env file on disk.
+    if os.environ.get("VIBEVOICE_MODE"):
+        return
+    env_path = os.path.join(os.path.dirname(__file__), os.pardir, ".env")
+    if os.path.exists(env_path):
+        return
+
+    print()
+    print("=" * 68)
+    print("  NO .env FILE DETECTED - using LOCAL MODE by default.")
+    print("=" * 68)
+    print("  This will download the VibeVoice model (~3GB) and needs a GPU.")
+    print()
+    print("  To use a fast online TTS API instead (no model download):")
+    print("    1. cp .env.example .env")
+    print("    2. Edit .env  ->  set VIBEVOICE_MODE=api and add your API key")
+    print("    3. Re-run this command")
+    print()
+    print("  See https://github.com/Kabirconnects/VibeVoice for instructions.")
+    print("=" * 68)
+    print()
+
+
 def get_mode() -> str:
     """Return 'local' or 'api' based on VIBEVOICE_MODE env var."""
+    _warn_if_no_env()
     return _env("VIBEVOICE_MODE", "local").lower()
 
 
