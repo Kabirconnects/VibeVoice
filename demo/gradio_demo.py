@@ -1,5 +1,9 @@
 """
 VibeVoice Gradio Demo - High-Quality Dialogue Generation Interface with Streaming Support
+
+Supports two modes controlled via .env (see .env.example):
+  VIBEVOICE_MODE=local  – load weights from MODEL_PATH (default)
+  VIBEVOICE_MODE=api    – call an OpenAI-compatible TTS API
 """
 
 import argparse
@@ -9,6 +13,12 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+# Ensure UTF-8 output on Windows consoles to prevent UnicodeEncodeError with emojis
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from typing import List, Dict, Any, Iterator, Optional
 from datetime import datetime
 import threading
@@ -17,9 +27,21 @@ import gradio as gr
 import librosa
 import soundfile as sf
 import torch
-import os
 import traceback
 import re
+
+# Load .env file before any other project imports so env vars are available
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(dotenv_path=_env_path, override=False)
+except ImportError:
+    pass  # python-dotenv not installed; rely on env vars already set in shell
+
+# API/local provider abstraction — works whether run as a module or directly
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(__file__))
+from api_provider import build_tts_backend, get_mode, get_model_path, APITTSBackend, generate_multi_speaker
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
@@ -34,17 +56,32 @@ logger = logging.get_logger(__name__)
 
 
 class VibeVoiceDemo:
-    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5, adapter_path: Optional[str] = None):
-        """Initialize the VibeVoice demo with model loading."""
+    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5, adapter_path: Optional[str] = None, mode: str = "local"):
+        """Initialize the VibeVoice demo with model loading.
+
+        When mode='api' the local model is NOT loaded; generation is delegated
+        to APITTSBackend which calls an OpenAI-compatible endpoint configured
+        via .env (API_KEY, API_BASE_URL, API_MODEL, …).
+        """
         self.model_path = model_path
         self.device = device
         self.inference_steps = inference_steps
         self.adapter_path = adapter_path
+        self.mode = mode  # "local" or "api"
         self.loaded_adapter_root: Optional[str] = None
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
-        self.load_model()
+        self.api_backend = None  # Set when mode="api"
+
+        if self.mode == "api":
+            print("🌐 API mode: skipping local model load, using online API")
+            self.api_backend = build_tts_backend()  # reads API_PROVIDER from .env
+            self.model = None
+            self.processor = None
+        else:
+            self.load_model()
+
         self.setup_voice_presets()
         self.load_example_scripts()  # Load example scripts
         
@@ -218,11 +255,11 @@ class VibeVoiceDemo:
                                  seed: Optional[int] = None,
                                  disable_voice_cloning: bool = False) -> Iterator[tuple]:
         try:
-            
+
             # Reset stop flag and set generating state
             self.stop_generation = False
             self.is_generating = True
-            
+
             # Validate inputs
             if not script.strip():
                 self.is_generating = False
@@ -230,20 +267,65 @@ class VibeVoiceDemo:
 
             # Defend against common mistake
             script = script.replace("’", "'")
-            
+
             if num_speakers < 1 or num_speakers > 4:
                 self.is_generating = False
                 raise gr.Error("Error: Number of speakers must be between 1 and 4.")
-            
+
+            # ── API mode: delegate to online TTS endpoint ─────────────────────
+            if self.mode == "api":
+                info_str = getattr(self.api_backend, "info", "Online API")
+                log = f"🌐 API mode: {info_str}\n"
+                log += f"🎙️ Generating podcast with {num_speakers} speaker(s)\n"
+                log += f"📝 Formatting script & sending {num_speakers} segment(s) to API...\n"
+                log += f"🗣️ Speaker voices: {self._api_speaker_voices_summary()}\n"
+                yield None, None, log, gr.update(visible=False)
+
+                # Apply the same auto-assignment as local mode so plain-text
+                # scripts get proper "Speaker N:" rotation labels.
+                lines = [l.strip() for l in script.strip().split('\n') if l.strip()]
+                formatted_script_lines = []
+                for line in lines:
+                    if line.startswith('Speaker ') and ':' in line:
+                        formatted_script_lines.append(line)
+                    else:
+                        speaker_id = len(formatted_script_lines) % num_speakers
+                        formatted_script_lines.append(f"Speaker {speaker_id}: {line}")
+                formatted_script = '\n'.join(formatted_script_lines)
+
+                try:
+                    audio_np, sample_rate = generate_multi_speaker(
+                        self.api_backend, formatted_script, num_speakers=num_speakers
+                    )
+                except Exception as api_err:
+                    self.is_generating = False
+                    error_msg = f"❌ API error: {api_err}"
+                    yield None, None, error_msg, gr.update(visible=False)
+                    return
+
+                # Convert to 16-bit and write to temp file for download
+                audio_16bit = convert_to_16_bit_wav(audio_np)
+                import tempfile, soundfile as _sf2
+                out_path = os.path.join(tempfile.gettempdir(), "vibevoice_api_output.wav")
+                _sf2.write(out_path, audio_16bit, sample_rate, subtype="PCM_16")
+
+                duration = len(audio_np) / sample_rate
+                final_log = log + f"✅ Done. Audio duration: {duration:.1f}s\n"
+                final_log += "💡 Download via the Complete Audio player below."
+                self.is_generating = False
+                yield None, out_path, final_log, gr.update(visible=False)
+                return
+
+            # ── Local mode ────────────────────────────────────────────────────
             # Collect selected speakers
             selected_speakers = [speaker_1, speaker_2, speaker_3, speaker_4][:num_speakers]
-            
+
             # Validate speaker selections
             for i, speaker in enumerate(selected_speakers):
                 if not speaker or speaker not in self.available_voices:
                     self.is_generating = False
                     raise gr.Error(f"Error: Please select a valid speaker for Speaker {i+1}.")
-            
+
             voice_cloning_enabled = not disable_voice_cloning
 
             # Resolve per-run parameters
@@ -619,6 +701,17 @@ class VibeVoiceDemo:
             except Exception as e:
                 print(f"Error stopping streamer: {e}")
         print("🛑 Audio generation stop requested")
+
+    def _api_speaker_voices_summary(self) -> str:
+        """Human-readable list of the voices the API backend uses per speaker."""
+        backend = self.api_backend
+        if backend is None:
+            return "n/a"
+        voices = getattr(backend, "voices", None) or []
+        default = getattr(backend, "voice", None)
+        if not voices:
+            return f"all -> {default!r} (set API_VOICES for distinct voices)"
+        return ", ".join(f"Speaker {i+1} -> {v!r}" for i, v in enumerate(voices))
     
     def load_example_scripts(self):
         """Load example scripts from the text_examples directory."""
@@ -1080,20 +1173,20 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/tmp/vibevoice-model",
-        help="Path to the VibeVoice model directory",
+        default=None,
+        help="Path to the VibeVoice model directory (overrides MODEL_PATH in .env)",
     )
     parser.add_argument(
         "--device",
         type=str,
         default=("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")),
-        help="Device for inference: cuda | mps | cpu",
+        help="Device for inference: cuda | mps | cpu (local mode only)",
     )
     parser.add_argument(
         "--inference_steps",
         type=int,
         default=10,
-        help="Number of inference steps for DDPM (not exposed to users)",
+        help="Number of inference steps for DDPM (local mode only)",
     )
     parser.add_argument(
         "--share",
@@ -1110,26 +1203,32 @@ def parse_args():
         "--checkpoint_path",
         type=str,
         default=None,
-        help="Path to a fine-tuned checkpoint directory containing LoRA adapters (optional)",
+        help="Path to a fine-tuned checkpoint directory containing LoRA adapters (local mode only)",
     )
-    
+
     return parser.parse_args()
 
 
 def main():
     """Main function to run the demo."""
     args = parse_args()
-    
+
     set_seed(42)  # Set a fixed seed for reproducibility
 
-    print("🎙️ Initializing VibeVoice Demo with Streaming Support...")
-    
+    mode = get_mode()
+    # CLI --model_path overrides .env MODEL_PATH in local mode
+    if args.model_path:
+        os.environ["MODEL_PATH"] = args.model_path
+
+    print(f"🎙️ Initializing VibeVoice Demo (mode={mode})...")
+
     # Initialize demo instance
     demo_instance = VibeVoiceDemo(
-        model_path=args.model_path,
+        model_path=get_model_path(),
         device=args.device,
         inference_steps=args.inference_steps,
         adapter_path=args.checkpoint_path,
+        mode=mode,
     )
     
     # Create interface

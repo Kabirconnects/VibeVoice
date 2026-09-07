@@ -1,10 +1,30 @@
 import argparse
 import os
+import sys
 import re
 import traceback
+from pathlib import Path
 from typing import List, Tuple, Union, Dict, Any
 import time
 import torch
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# Load .env before any project imports so env vars are available
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(dotenv_path=_env_path, override=False)
+except ImportError:
+    pass  # rely on env vars already set in shell
+
+# API/local provider abstraction — works whether run as a module or directly
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(__file__))
+from api_provider import build_tts_backend, get_mode, get_model_path, APITTSBackend, generate_multi_speaker
 
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.modular.lora_loading import load_lora_assets
@@ -142,10 +162,10 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="microsoft/VibeVoice-1.5b",
-        help="Path to the HuggingFace model directory",
+        default=None,
+        help="Path to the HuggingFace model directory (overrides MODEL_PATH in .env; local mode only)",
     )
-    
+
     parser.add_argument(
         "--txt_path",
         type=str,
@@ -169,42 +189,49 @@ def parse_args():
         "--device",
         type=str,
         default=("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")),
-        help="Device for inference: cuda | mps | cpu",
+        help="Device for inference: cuda | mps | cpu (local mode only)",
     )
     parser.add_argument(
         "--checkpoint_path",
         type=str,
         default=None,
-        help="Path to a fine-tuned checkpoint directory containing LoRA adapters (optional)",
+        help="Path to a fine-tuned checkpoint directory containing LoRA adapters (local mode only)",
     )
     parser.add_argument(
         "--disable_prefill",
         action="store_true",
-        help="Disable speech prefill (voice cloning) by setting is_prefill=False during generation",
+        help="Disable speech prefill (voice cloning) — local mode only",
     )
     parser.add_argument(
         "--cfg_scale",
         type=float,
         default=1.3,
-        help="CFG (Classifier-Free Guidance) scale for generation (default: 1.3)",
+        help="CFG (Classifier-Free Guidance) scale for generation (local mode only)",
     )
     parser.add_argument(
-    "--seed",
-    type=int,
-    default=None,
-    help="Random seed for reproducibility (optional)",
-)
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (local mode only)",
+    )
     parser.add_argument(
         "--dtype",
         type=str,
         choices=["auto", "float32", "float16", "bfloat16"],
         default="auto",
-        help="Model dtype. auto = float16 on mps, bfloat16 on cuda, float32 on cpu",
+        help="Model dtype — auto = float16 on mps, bfloat16 on cuda, float32 on cpu (local mode only)",
     )
     return parser.parse_args()
 
 def main():
     args = parse_args()
+
+    # CLI --model_path overrides .env MODEL_PATH
+    if args.model_path:
+        os.environ["MODEL_PATH"] = args.model_path
+
+    mode = get_mode()
+    print(f"VibeVoice inference mode: {mode}")
 
     # Normalize potential 'mpx' typo to 'mps'
     if args.device.lower() == "mpx":
@@ -224,127 +251,136 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
-    # Initialize voice mapper
-    voice_mapper = VoiceMapper()
-    
-    # Check if txt file exists
+    # ── Read & parse the script file ─────────────────────────────────────────
     if not os.path.exists(args.txt_path):
         print(f"Error: txt file not found: {args.txt_path}")
         return
-    
-    # Read and parse txt file
+
     print(f"Reading script from: {args.txt_path}")
     with open(args.txt_path, 'r', encoding='utf-8') as f:
         txt_content = f.read()
-    
-    # Parse the txt content to get speaker numbers
+
     scripts, speaker_numbers = parse_txt_script(txt_content)
-    
+
     if not scripts:
         print("Error: No valid speaker scripts found in the txt file")
         return
-    
+
     print(f"Found {len(scripts)} speaker segments:")
     for i, (script, speaker_num) in enumerate(zip(scripts, speaker_numbers)):
         print(f"  {i+1}. Speaker {speaker_num}")
         print(f"     Text preview: {script[:100]}...")
-    
+
+    full_script = '\n'.join(scripts)
+    full_script = full_script.replace("’", "'")
+
+    # ── API mode ──────────────────────────────────────────────────────────────
+    if mode == "api":
+        import soundfile as sf
+        import numpy as np
+
+        backend = build_tts_backend(device=args.device)
+        num_api_speakers = len(set(speaker_numbers))
+        print(f"Starting API-based generation ({num_api_speakers} speaker(s), one voice each)...")
+        start_time = time.time()
+        audio_np, sample_rate = generate_multi_speaker(
+            backend, full_script, num_speakers=num_api_speakers
+        )
+        generation_time = time.time() - start_time
+
+        audio_duration = len(audio_np) / sample_rate
+        print(f"Generation time : {generation_time:.2f}s")
+        print(f"Audio duration  : {audio_duration:.2f}s")
+
+        txt_filename = os.path.splitext(os.path.basename(args.txt_path))[0]
+        output_path = os.path.join(args.output_dir, f"{txt_filename}_generated.wav")
+        os.makedirs(args.output_dir, exist_ok=True)
+        sf.write(output_path, audio_np, sample_rate)
+        print(f"Saved output to {output_path}")
+        return
+
+    # ── Local mode (original behaviour) ──────────────────────────────────────
+    # Initialize voice mapper
+    voice_mapper = VoiceMapper()
+
     # Map speaker numbers to provided speaker names
     speaker_name_mapping = {}
     speaker_names_list = args.speaker_names if isinstance(args.speaker_names, list) else [args.speaker_names]
     for i, name in enumerate(speaker_names_list, 1):
         speaker_name_mapping[str(i)] = name
-    
+
     print(f"\nSpeaker mapping:")
     for speaker_num in set(speaker_numbers):
         mapped_name = speaker_name_mapping.get(speaker_num, f"Speaker {speaker_num}")
         print(f"  Speaker {speaker_num} -> {mapped_name}")
-    
-    # Map speakers to voice files using the provided speaker names
+
+    # Map speakers to voice files
     voice_samples = []
     actual_speakers = []
-    
-    # Get unique speaker numbers in order of first appearance
+
     unique_speaker_numbers = []
     seen = set()
     for speaker_num in speaker_numbers:
         if speaker_num not in seen:
             unique_speaker_numbers.append(speaker_num)
             seen.add(speaker_num)
-    
+
     for speaker_num in unique_speaker_numbers:
         speaker_name = speaker_name_mapping.get(speaker_num, f"Speaker {speaker_num}")
         voice_path = voice_mapper.get_voice_path(speaker_name)
         voice_samples.append(voice_path)
         actual_speakers.append(speaker_name)
         print(f"Speaker {speaker_num} ('{speaker_name}') -> Voice: {os.path.basename(voice_path)}")
-    
-    # Prepare data for model
-    full_script = '\n'.join(scripts)
-    full_script = full_script.replace("’", "'")        
-    
-    print(f"Loading processor & model from {args.model_path}")
-    processor = VibeVoiceProcessor.from_pretrained(args.model_path)
 
+    model_path = get_model_path()
+    print(f"Loading processor & model from {model_path}")
+    processor = VibeVoiceProcessor.from_pretrained(model_path)
 
     # Decide dtype & attention implementation
     if args.device == "mps":
-        # float16, not float32: fp32 doubles the 1.5B model to ~11 GB, which
-        # pushes 16 GB Apple Silicon machines into swap (measured 92 s/step on
-        # an M1 Pro vs ~5 it/s at fp16, with clean fp16 output — no NaNs).
-        # fp16 is natively supported by M-series GPUs; use --dtype float32
-        # to restore the old behavior.
         load_dtype = torch.float16
-        attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
+        attn_impl_primary = "sdpa"
     elif args.device == "cuda":
         load_dtype = torch.bfloat16
         attn_impl_primary = "flash_attention_2"
-    else:  # cpu
+    else:
         load_dtype = torch.float32
         attn_impl_primary = "sdpa"
     if args.dtype != "auto":
         load_dtype = getattr(torch, args.dtype)
     print(f"Using device: {args.device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
-    # Load model with device-specific logic
+
     try:
         if args.device == "mps":
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                args.model_path,
-                torch_dtype=load_dtype,
-                attn_implementation=attn_impl_primary,
-                device_map=None,  # load then move
+                model_path, torch_dtype=load_dtype,
+                attn_implementation=attn_impl_primary, device_map=None,
             )
             model.to("mps")
         elif args.device == "cuda":
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                args.model_path,
-                torch_dtype=load_dtype,
-                device_map="cuda",
-                attn_implementation=attn_impl_primary,
+                model_path, torch_dtype=load_dtype,
+                device_map="cuda", attn_implementation=attn_impl_primary,
             )
-        else:  # cpu
+        else:
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                args.model_path,
-                torch_dtype=load_dtype,
-                device_map="cpu",
-                attn_implementation=attn_impl_primary,
+                model_path, torch_dtype=load_dtype,
+                device_map="cpu", attn_implementation=attn_impl_primary,
             )
     except Exception as e:
         if attn_impl_primary == 'flash_attention_2':
             print(f"[ERROR] : {type(e).__name__}: {e}")
             print(traceback.format_exc())
-            print("Error loading the model. Trying to use SDPA. However, note that only flash_attention_2 has been fully tested, and using SDPA may result in lower audio quality.")
+            print("Falling back to SDPA.")
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                args.model_path,
-                torch_dtype=load_dtype,
+                model_path, torch_dtype=load_dtype,
                 device_map=(args.device if args.device in ("cuda", "cpu") else None),
-                attn_implementation='sdpa'
+                attn_implementation='sdpa',
             )
             if args.device == "mps":
                 model.to("mps")
         else:
             raise e
-
 
     if args.checkpoint_path:
         print(f"Loading fine-tuned assets from {args.checkpoint_path}")
@@ -379,18 +415,16 @@ def main():
     model.set_ddpm_inference_steps(num_steps=10)
 
     if hasattr(model.model, 'language_model'):
-       print(f"Language model attention: {model.model.language_model.config._attn_implementation}")
-       
-    # Prepare inputs for the model
+        print(f"Language model attention: {model.model.language_model.config._attn_implementation}")
+
     inputs = processor(
-        text=[full_script], # Wrap in list for batch processing
-        voice_samples=[voice_samples], # Wrap in list for batch processing
+        text=[full_script],
+        voice_samples=[voice_samples],
         padding=True,
         return_tensors="pt",
         return_attention_mask=True,
     )
 
-    # Move tensors to target device
     target_device = args.device if args.device != "cpu" else "cpu"
     for k, v in inputs.items():
         if torch.is_tensor(v):
@@ -398,7 +432,6 @@ def main():
 
     print(f"Starting generation with cfg_scale: {args.cfg_scale}")
 
-    # Generate audio
     start_time = time.time()
     outputs = model.generate(
         **inputs,
@@ -411,41 +444,36 @@ def main():
     )
     generation_time = time.time() - start_time
     print(f"Generation time: {generation_time:.2f} seconds")
-    
-    # Calculate audio duration and additional metrics
+
     if outputs.speech_outputs and outputs.speech_outputs[0] is not None:
-        # Assuming 24kHz sample rate (common for speech synthesis)
         sample_rate = 24000
         audio_samples = outputs.speech_outputs[0].shape[-1] if len(outputs.speech_outputs[0].shape) > 0 else len(outputs.speech_outputs[0])
         audio_duration = audio_samples / sample_rate
         rtf = generation_time / audio_duration if audio_duration > 0 else float('inf')
-        
+
         print(f"Generated audio duration: {audio_duration:.2f} seconds")
         print(f"RTF (Real Time Factor): {rtf:.2f}x")
     else:
         print("No audio output generated")
-    
-    # Calculate token metrics
-    input_tokens = inputs['input_ids'].shape[1]  # Number of input tokens
-    output_tokens = outputs.sequences.shape[1]  # Total tokens (input + generated)
+
+    input_tokens = inputs['input_ids'].shape[1]
+    output_tokens = outputs.sequences.shape[1]
     generated_tokens = output_tokens - input_tokens
-    
+
     print(f"Prefilling tokens: {input_tokens}")
     print(f"Generated tokens: {generated_tokens}")
     print(f"Total tokens: {output_tokens}")
 
-    # Save output (processor handles device internally)
     txt_filename = os.path.splitext(os.path.basename(args.txt_path))[0]
     output_path = os.path.join(args.output_dir, f"{txt_filename}_generated.wav")
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     processor.save_audio(
-        outputs.speech_outputs[0], # First (and only) batch item
+        outputs.speech_outputs[0],
         output_path=output_path,
     )
     print(f"Saved output to {output_path}")
-    
-    # Print summary
+
     print("\n" + "="*50)
     print("GENERATION SUMMARY")
     print("="*50)
@@ -462,7 +490,6 @@ def main():
     print(f"RTF (Real Time Factor): {rtf:.2f}x")
     if args.seed is not None:
         print(f"Seed used: {args.seed}")
-
     print("="*50)
 
 if __name__ == "__main__":

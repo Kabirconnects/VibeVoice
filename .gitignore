@@ -1,5 +1,8 @@
 # Initially taken from Github's Python gitignore file
 
+# Local environment / secrets — never commit
+.env
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
